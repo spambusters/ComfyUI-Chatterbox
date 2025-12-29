@@ -1,7 +1,7 @@
 <!-- Improved compatibility of back to top link: See: https://github.com/othneildrew/Best-README-Template/pull/73 -->
 <a id="readme-top"></a>
 
-<h1>Fork with small changes, just as the addition of a [pause], which also resets the token counts and allows much longer texts to be processed in one shot.</h1>
+<h1>Fork with small changes, such as the addition of a [pause] in the text input, which also resets the token counts and allows much longer texts to be processed in one shot.</h1>
 
 <!-- PROJECT LOGO -->
 <br />
