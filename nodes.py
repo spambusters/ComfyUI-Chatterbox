@@ -5,6 +5,7 @@ import soundfile as sf
 import numpy as np
 import logging
 import perth
+import random
 
 import comfy.model_management as mm
 import comfy.model_patcher
@@ -132,84 +133,64 @@ class ChatterboxTTSNode:
 
     def synthesize(self, model_pack_name, text, max_new_tokens, flow_cfg_scale, exaggeration, temperature, cfg_weight, repetition_penalty, min_p, top_p, seed, use_watermark, audio_prompt=None):
         if not text.strip():
-            logger.info("Empty text provided, returning silent audio.")
-            dummy_sr = 24000; silent_waveform = torch.zeros((1, dummy_sr), dtype=torch.float32, device="cpu")
-            return ({"waveform": silent_waveform.unsqueeze(0), "sample_rate": dummy_sr},)
+            dummy_sr = 24000; silent_waveform = torch.zeros((1, 1, dummy_sr))
+            return ({"waveform": silent_waveform, "sample_rate": dummy_sr},)
 
+        # 1. Standard Setup
         cache_key = model_pack_name
-        if cache_key not in CHATTERBOX_PATCHER_CACHE:
+        patcher = CHATTERBOX_PATCHER_CACHE.get(cache_key)
+        if patcher is None:
             load_device = mm.get_torch_device()
-            logger.info(f"Creating Chatterbox ModelPatcher for {model_pack_name} on device {load_device}")
             model_wrapper = ChatterboxModelWrapper(model_pack_name)
-            patcher = ChatterboxPatcher(
-                model=model_wrapper,
-                load_device=load_device,
-                offload_device=mm.unet_offload_device(),
-                size=int(1.5 * 1024**3)
-            )
+            patcher = ChatterboxPatcher(model=model_wrapper, load_device=load_device, offload_device=mm.unet_offload_device(), size=int(1.5 * 1024**3))
             CHATTERBOX_PATCHER_CACHE[cache_key] = patcher
-
-        patcher = CHATTERBOX_PATCHER_CACHE[cache_key]
 
         mm.load_model_gpu(patcher)
         tts_model = patcher.model.tts_model
-
-        if tts_model is None:
-            logger.error("TTS model failed to load. Please check logs for download or loading errors.")
-            dummy_sr = 24000; silent_waveform = torch.zeros((1, dummy_sr), dtype=torch.float32, device="cpu")
-            return ({"waveform": silent_waveform.unsqueeze(0), "sample_rate": dummy_sr},)
-
         set_chatterbox_seed(seed)
-
-        is_perth_installed = not getattr(perth, '_is_mock', False)
-        if use_watermark and not is_perth_installed:
-            logger.warning("Watermarking is enabled, but 'resemble-perth' is not installed. Output will not be watermarked.")
-
-        original_watermarker = tts_model.watermarker
-        if not use_watermark:
-            class TmpDummyWatermarker:
-                def apply_watermark(self, wav, sample_rate): return wav
-            tts_model.watermarker = TmpDummyWatermarker()
-            if is_perth_installed: logger.info("Watermarking disabled by user.")
-
-        wav_tensor_chatterbox = None; audio_prompt_path_temp = None
         
-        pbar = ProgressBar(max_new_tokens)
+        # 2. Split Text and Prepare Audio List
+        segments = [s.strip() for s in text.split("[pause]") if s.strip()]
+        combined_wavs = []
+        sample_rate = tts_model.sr
+        audio_prompt_path_temp = None
 
-        try:
-            if audio_prompt and audio_prompt.get("waveform") is not None and audio_prompt["waveform"].numel() > 0:
-                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_wav:
-                    audio_prompt_path_temp = tmp_wav.name
-                    waveform_in = audio_prompt["waveform"]; sample_rate_in = audio_prompt["sample_rate"]
-                    waveform_cpu = waveform_in.cpu()[0]
-                    current_waveform = torch.mean(waveform_cpu, dim=0) if waveform_cpu.shape[0] > 1 else waveform_cpu.squeeze(0)
-                    sf.write(audio_prompt_path_temp, current_waveform.numpy().astype(np.float32), sample_rate_in)
+        # 3. Handle Voice Clone Prompt
+        if audio_prompt and audio_prompt.get("waveform") is not None:
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_wav:
+                audio_prompt_path_temp = tmp_wav.name
+                waveform_cpu = audio_prompt["waveform"].cpu()[0]
+                current_waveform = torch.mean(waveform_cpu, dim=0) if waveform_cpu.shape[0] > 1 else waveform_cpu.squeeze(0)
+                sf.write(audio_prompt_path_temp, current_waveform.numpy().astype(np.float32), audio_prompt["sample_rate"])
 
-            wav_tensor_chatterbox = tts_model.generate(
-                text,
-                audio_prompt_path=audio_prompt_path_temp,
-                exaggeration=exaggeration,
-                temperature=temperature,
-                cfg_weight=cfg_weight,
-                repetition_penalty=repetition_penalty,
-                min_p=min_p,
-                top_p=top_p,
-                pbar=pbar,
-                max_new_tokens=max_new_tokens,
-                flow_cfg_scale=flow_cfg_scale
+        # 4. Generate Segments
+        for i, seg_text in enumerate(segments):
+            pbar = ProgressBar(max_new_tokens) # New progress bar per segment
+            seg_wav = tts_model.generate(
+                seg_text, audio_prompt_path=audio_prompt_path_temp, exaggeration=exaggeration,
+                temperature=temperature, cfg_weight=cfg_weight, repetition_penalty=repetition_penalty,
+                min_p=min_p, top_p=top_p, pbar=pbar, max_new_tokens=max_new_tokens, flow_cfg_scale=flow_cfg_scale
             )
-        except Exception as e:
-            logger.error(f"Error during TTS generation: {e}", exc_info=True)
-            dummy_sr = 24000; silent_waveform = torch.zeros((1, dummy_sr), dtype=torch.float32, device="cpu")
-            return ({"waveform": silent_waveform.unsqueeze(0), "sample_rate": dummy_sr},)
-        finally:
-            tts_model.watermarker = original_watermarker
-            if audio_prompt_path_temp and os.path.exists(audio_prompt_path_temp):
-                try: os.remove(audio_prompt_path_temp)
-                except Exception as e: logger.error(f"Error removing temp audio prompt file: {e}")
+            
+            # Ensure the segment is 1D [samples] before adding to list
+            combined_wavs.append(seg_wav.detach().cpu().view(-1))
 
-        wav_tensor_comfy = wav_tensor_chatterbox.cpu().unsqueeze(0)
-        return ({"waveform": wav_tensor_comfy, "sample_rate": tts_model.sr},)
+            # Add a natural, variable pause
+            if i < len(segments) - 1:
+                # Randomly chooses a pause between 0.3 and 0.7 seconds
+                duration = random.uniform(0.3, 0.7) 
+                silence_samples = int(sample_rate * duration)
+                silence = torch.zeros(silence_samples)
+                combined_wavs.append(silence)
+
+        # 5. Final Stitching
+        if audio_prompt_path_temp and os.path.exists(audio_prompt_path_temp):
+            os.remove(audio_prompt_path_temp)
+
+        # Join pieces and reshape to [Batch=1, Channel=1, Samples]
+        final_wav = torch.cat(combined_wavs, dim=0).unsqueeze(0).unsqueeze(0)
+        
+        return ({"waveform": final_wav, "sample_rate": sample_rate},)
 
 class ChatterboxVCNode:
     @classmethod
